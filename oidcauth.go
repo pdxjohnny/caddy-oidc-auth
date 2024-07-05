@@ -6,11 +6,13 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/coreos/go-oidc"
+	"github.com/golang-jwt/jwt"
 	"golang.org/x/oauth2"
 )
 
@@ -23,6 +25,7 @@ type OIDCAuth struct {
 	ClientSecret string `json:"client_secret"`
 	Issuer       string `json:"issuer"`
 	RedirectURL  string `json:"redirect_url"`
+	Audience     string `json:"audience"`
 }
 
 func (OIDCAuth) CaddyModule() caddy.ModuleInfo {
@@ -72,21 +75,51 @@ func (oa OIDCAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
 	}
 
-	state, err := generateRandomState(32)
-	if err != nil {
-		return err
+	// Get the ID token from the request (you may need to adjust this depending on your specific setup)
+	idToken := r.Header.Get("Authorization")
+	if idToken == "" {
+		return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("missing id_token"))
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "oidc_state",
-		Value:    state,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-	})
+	// Extract the token from the "Bearer" scheme
+	parts := strings.Split(idToken, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid authorization header format"))
+	}
+	idToken = parts[1]
 
-	http.Redirect(w, r, oauth2Config.AuthCodeURL(state), http.StatusFound)
-	return nil
+	// Parse and validate the ID token
+	token, err := jwt.Parse(idToken, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		// Use the key from the provider to validate the token
+		keySet := oidc.NewRemoteKeySet(context.Background(), oa.Issuer+"/.well-known/jwks.json")
+		key, err := keySet.VerifySignature(context.Background(), []byte(idToken))
+		return key, err
+	})
+	if err != nil {
+		return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("failed to verify id_token: %v", err))
+	}
+
+	// Determine the expected audience
+	expectedAudience := oa.Audience
+	if expectedAudience == "" {
+		expectedAudience = r.Host
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		// Validate the audience
+		audience := claims["aud"].(string)
+		if audience != expectedAudience {
+			return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid audience"))
+		}
+	} else {
+		return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("invalid token claims"))
+	}
+
+	// Continue with the next handler
+	return next.ServeHTTP(w, r)
 }
 
 func (oa *OIDCAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -107,6 +140,10 @@ func (oa *OIDCAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 			case "redirect_url":
 				if !d.Args(&oa.RedirectURL) {
+					return d.ArgErr()
+				}
+			case "audience":
+				if !d.Args(&oa.Audience) {
 					return d.ArgErr()
 				}
 			}
