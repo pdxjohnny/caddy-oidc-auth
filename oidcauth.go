@@ -53,7 +53,7 @@ func (oa *OIDCAuth) Validate() error {
 		return fmt.Errorf("redirect_url is required")
 	}
 
-	provider, err := oidc.NewProvider(context.Background(), oa.Issuer)
+	_, err := oidc.NewProvider(context.Background(), oa.Issuer)
 	if err != nil {
 		return fmt.Errorf("failed to connect to issuer: %v", err)
 	}
@@ -78,7 +78,21 @@ func (oa OIDCAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Get the ID token from the request (you may need to adjust this depending on your specific setup)
 	idToken := r.Header.Get("Authorization")
 	if idToken == "" {
-		return caddyhttp.Error(http.StatusUnauthorized, fmt.Errorf("missing id_token"))
+		state, err := generateRandomState(32)
+		if err != nil {
+			return err
+		}
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     "oidc_state",
+			Value:    state,
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   true,
+		})
+
+		http.Redirect(w, r, oauth2Config.AuthCodeURL(state), http.StatusFound)
+		return nil
 	}
 
 	// Extract the token from the "Bearer" scheme
@@ -95,7 +109,7 @@ func (oa OIDCAuth) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 		// Use the key from the provider to validate the token
 		keySet := oidc.NewRemoteKeySet(context.Background(), oa.Issuer+"/.well-known/jwks.json")
-		key, err := keySet.VerifySignature(context.Background(), []byte(idToken))
+		key, err := keySet.VerifySignature(context.Background(), idToken)
 		return key, err
 	})
 	if err != nil {
